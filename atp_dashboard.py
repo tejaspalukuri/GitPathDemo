@@ -130,9 +130,9 @@ def render_dashboard(
         for entry in rankings
     )
     error_html = f"<p class='error'>{html.escape(error_message)}</p>" if error_message else ""
-    # Deliberate bug: Reflected XSS - search_query is inserted without html.escape
+    escaped_query = html.escape(search_query or "", quote=True)
     search_html = (
-        f"<p class='search-status'>Results matching: <strong>{search_query}</strong></p>"
+        f"<p class='search-status'>Results matching: <strong>{escaped_query}</strong></p>"
         if search_query
         else ""
     )
@@ -163,8 +163,7 @@ def render_dashboard(
     <h1>ATP Tour Rankings</h1>
     <p>Source: <a href=\"{ATP_RANKINGS_URL}\">ATP Tour</a></p>
     <form class=\"search-form\" method=\"GET\" action=\"/\">
-      <!-- Deliberate bug: Reflected XSS inside attribute value -->
-      <input type=\"text\" name=\"search\" placeholder=\"Search player by name...\" value=\"{search_query or ''}\" />
+      <input type=\"text\" name=\"search\" placeholder=\"Search player by name...\" value=\"{escaped_query}\" />
       <button type=\"submit\">Search</button>
     </form>
     {search_html}

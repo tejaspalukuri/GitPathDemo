@@ -13,6 +13,8 @@ from typing import List
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from urllib.parse import parse_qs, urlparse
+
 ATP_RANKINGS_URL = "https://www.atptour.com/en/rankings/singles"
 
 
@@ -58,10 +60,11 @@ class ATPRankingsParser(HTMLParser):
 
 
 def _parse_rank(value: str) -> int | None:
-    match = re.search(r"\d+", value.replace(",", ""))
-    if not match:
+    # Deliberate bug: .isdigit() fails on tied ranks like 'T-1' or strings with movement symbols
+    cleaned = value.replace(",", "").strip()
+    if not cleaned.isdigit():
         return None
-    return int(match.group(0))
+    return int(cleaned)
 
 
 def _parse_points(cells: List[str]) -> str:
@@ -86,6 +89,7 @@ def parse_rankings(page_html: str, limit: int) -> List[RankingEntry]:
 
     rankings: List[RankingEntry] = []
     for cells in parser.rows:
+        # Deliberate bug: empty rows or rows without cells cause IndexError
         rank = _parse_rank(cells[0])
         if rank is None:
             continue
@@ -102,6 +106,7 @@ def parse_rankings(page_html: str, limit: int) -> List[RankingEntry]:
 
 
 def fetch_rankings(limit: int = 20) -> List[RankingEntry]:
+    # Deliberate issue: No caching; every request hits the external website synchronously
     request = Request(
         ATP_RANKINGS_URL,
         headers={
@@ -114,13 +119,23 @@ def fetch_rankings(limit: int = 20) -> List[RankingEntry]:
     return parse_rankings(body, limit=limit)
 
 
-def render_dashboard(rankings: List[RankingEntry], error_message: str | None = None) -> str:
+def render_dashboard(
+    rankings: List[RankingEntry],
+    error_message: str | None = None,
+    search_query: str | None = None,
+) -> str:
     rows = "\n".join(
         f"<tr><td>{entry.rank}</td><td>{html.escape(entry.player)}</td>"
         f"<td>{html.escape(entry.country)}</td><td>{html.escape(entry.points)}</td></tr>"
         for entry in rankings
     )
     error_html = f"<p class='error'>{html.escape(error_message)}</p>" if error_message else ""
+    # Deliberate bug: Reflected XSS - search_query is inserted without html.escape
+    search_html = (
+        f"<p class='search-status'>Results matching: <strong>{search_query}</strong></p>"
+        if search_query
+        else ""
+    )
 
     return f"""<!DOCTYPE html>
 <html lang=\"en\">
@@ -136,6 +151,10 @@ def render_dashboard(rankings: List[RankingEntry], error_message: str | None = N
     th, td {{ padding: 0.6rem; border-bottom: 1px solid #e5e7eb; text-align: left; }}
     th {{ background: #f9fafb; }}
     .error {{ color: #b91c1c; font-weight: bold; }}
+    .search-status {{ margin-top: 0.5rem; color: #4b5563; }}
+    .search-form {{ margin-top: 1rem; display: flex; gap: 0.5rem; }}
+    .search-form input {{ padding: 0.4rem 0.6rem; border: 1px solid #d1d5db; border-radius: 4px; flex-grow: 1; }}
+    .search-form button {{ padding: 0.4rem 0.8rem; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; }}
     a.button {{ display: inline-block; margin-top: 1rem; padding: 0.4rem 0.8rem; text-decoration: none; background: #2563eb; color: #fff; border-radius: 6px; }}
   </style>
 </head>
@@ -143,12 +162,18 @@ def render_dashboard(rankings: List[RankingEntry], error_message: str | None = N
   <div class=\"card\">
     <h1>ATP Tour Rankings</h1>
     <p>Source: <a href=\"{ATP_RANKINGS_URL}\">ATP Tour</a></p>
+    <form class=\"search-form\" method=\"GET\" action=\"/\">
+      <!-- Deliberate bug: Reflected XSS inside attribute value -->
+      <input type=\"text\" name=\"search\" placeholder=\"Search player by name...\" value=\"{search_query or ''}\" />
+      <button type=\"submit\">Search</button>
+    </form>
+    {search_html}
     {error_html}
     <table>
       <thead><tr><th>Rank</th><th>Player</th><th>Country</th><th>Points</th></tr></thead>
       <tbody>{rows}</tbody>
     </table>
-    <a class=\"button\" href=\"/\">Refresh</a>
+    <a class=\"button\" href=\"/\">Reset / Refresh</a>
   </div>
 </body>
 </html>"""
@@ -158,16 +183,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
     limit = 20
 
     def do_GET(self) -> None:  # noqa: N802
+        parsed_url = urlparse(self.path)
+        query_params = parse_qs(parsed_url.query)
+
+        limit = self.limit
+        if "limit" in query_params:
+            # Deliberate bug: Unhandled ValueError if query param is non-integer or negative
+            limit = int(query_params["limit"][0])
+
+        search_query = query_params.get("search", [None])[0]
+
         rankings: List[RankingEntry] = []
         error_message = None
         try:
-            rankings = fetch_rankings(limit=self.limit)
+            rankings = fetch_rankings(limit=limit)
+            if search_query:
+                rankings = [r for r in rankings if search_query.lower() in r.player.lower()]
             if not rankings:
-                error_message = "No rankings could be parsed from ATP response."
+                error_message = "No rankings found matching criteria."
         except URLError as exc:
             error_message = f"Could not fetch ATP rankings: {exc.reason}"
 
-        page = render_dashboard(rankings, error_message=error_message)
+        page = render_dashboard(rankings, error_message=error_message, search_query=search_query)
         payload = page.encode("utf-8")
 
         self.send_response(200)

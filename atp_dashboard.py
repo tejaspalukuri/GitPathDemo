@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import html
 import re
+import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -16,6 +17,10 @@ from urllib.request import Request, urlopen
 from urllib.parse import parse_qs, urlparse
 
 ATP_RANKINGS_URL = "https://www.atptour.com/en/rankings/singles"
+CACHE_TTL_SECONDS = 300  # 5 minutes
+
+_rankings_html_cache: str | None = None
+_rankings_cache_expires_at: float = 0.0
 
 
 @dataclass
@@ -105,8 +110,13 @@ def parse_rankings(page_html: str, limit: int) -> List[RankingEntry]:
     return rankings
 
 
-def fetch_rankings(limit: int = 20) -> List[RankingEntry]:
-    # Deliberate issue: No caching; every request hits the external website synchronously
+def clear_rankings_cache() -> None:
+    global _rankings_html_cache, _rankings_cache_expires_at
+    _rankings_html_cache = None
+    _rankings_cache_expires_at = 0.0
+
+
+def _fetch_rankings_html() -> str:
     request = Request(
         ATP_RANKINGS_URL,
         headers={
@@ -115,7 +125,29 @@ def fetch_rankings(limit: int = 20) -> List[RankingEntry]:
         },
     )
     with urlopen(request, timeout=20) as response:
-        body = response.read().decode("utf-8", errors="ignore")
+        return response.read().decode("utf-8", errors="ignore")
+
+
+def get_rankings_html(force_refresh: bool = False) -> str:
+    """Return ATP rankings HTML, using an in-memory TTL cache when fresh."""
+    global _rankings_html_cache, _rankings_cache_expires_at
+
+    now = time.monotonic()
+    if (
+        not force_refresh
+        and _rankings_html_cache is not None
+        and now < _rankings_cache_expires_at
+    ):
+        return _rankings_html_cache
+
+    body = _fetch_rankings_html()
+    _rankings_html_cache = body
+    _rankings_cache_expires_at = now + CACHE_TTL_SECONDS
+    return body
+
+
+def fetch_rankings(limit: int = 20, force_refresh: bool = False) -> List[RankingEntry]:
+    body = get_rankings_html(force_refresh=force_refresh)
     return parse_rankings(body, limit=limit)
 
 
@@ -173,7 +205,7 @@ def render_dashboard(
       <thead><tr><th>Rank</th><th>Player</th><th>Country</th><th>Points</th></tr></thead>
       <tbody>{rows}</tbody>
     </table>
-    <a class=\"button\" href=\"/\">Reset / Refresh</a>
+    <a class=\"button\" href=\"/?refresh=1\">Reset / Refresh</a>
   </div>
 </body>
 </html>"""
@@ -205,11 +237,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         limit = parse_limit_param(raw_limit, self.limit)
 
         search_query = query_params.get("search", [None])[0]
+        force_refresh = query_params.get("refresh", [""])[0] == "1"
 
         rankings: List[RankingEntry] = []
         error_message = None
         try:
-            rankings = fetch_rankings(limit=limit)
+            rankings = fetch_rankings(limit=limit, force_refresh=force_refresh)
             if search_query:
                 rankings = [r for r in rankings if search_query.lower() in r.player.lower()]
             if not rankings:

@@ -179,6 +179,21 @@ def render_dashboard(
 </html>"""
 
 
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+
+
+def parse_limit_param(raw_value: str | None, default: int) -> int:
+    """Parse and clamp a limit query value; fall back to default when invalid."""
+    if raw_value is None:
+        return default
+    try:
+        limit = int(raw_value)
+    except (TypeError, ValueError):
+        return default
+    return max(MIN_LIMIT, min(limit, MAX_LIMIT))
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     limit = 20
 
@@ -186,10 +201,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parsed_url = urlparse(self.path)
         query_params = parse_qs(parsed_url.query)
 
-        limit = self.limit
-        if "limit" in query_params:
-            # Deliberate bug: Unhandled ValueError if query param is non-integer or negative
-            limit = int(query_params["limit"][0])
+        raw_limit = query_params["limit"][0] if "limit" in query_params else None
+        limit = parse_limit_param(raw_limit, self.limit)
 
         search_query = query_params.get("search", [None])[0]
 

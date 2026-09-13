@@ -166,32 +166,33 @@ class TestDashboardHandler(unittest.TestCase):
             conn.request("GET", path)
             response = conn.getresponse()
             body = response.read().decode("utf-8")
-            return response.status, body
+            headers = {key.lower(): value for key, value in response.getheaders()}
+            return response.status, body, headers
         finally:
             conn.close()
 
     def test_default_request_returns_200(self):
         with patch("atp_dashboard.fetch_rankings", return_value=self.sample) as mocked:
-            status, body = self._get("/")
+            status, body, _ = self._get("/")
         self.assertEqual(status, 200)
         mocked.assert_called_once_with(limit=20, force_refresh=False)
         self.assertIn("Jannik Sinner", body)
 
     def test_limit_query_param_is_parsed(self):
         with patch("atp_dashboard.fetch_rankings", return_value=self.sample) as mocked:
-            status, _ = self._get("/?limit=5")
+            status, _, _ = self._get("/?limit=5")
         self.assertEqual(status, 200)
         mocked.assert_called_once_with(limit=5, force_refresh=False)
 
     def test_invalid_limit_falls_back_to_default(self):
         with patch("atp_dashboard.fetch_rankings", return_value=self.sample) as mocked:
-            status, _ = self._get("/?limit=abc")
+            status, _, _ = self._get("/?limit=abc")
         self.assertEqual(status, 200)
         mocked.assert_called_once_with(limit=20, force_refresh=False)
 
     def test_search_query_filters_results(self):
         with patch("atp_dashboard.fetch_rankings", return_value=self.sample):
-            status, body = self._get("/?search=Alcaraz")
+            status, body, _ = self._get("/?search=Alcaraz")
         self.assertEqual(status, 200)
         self.assertIn("Carlos Alcaraz", body)
         self.assertNotIn("Jannik Sinner", body)
@@ -199,9 +200,21 @@ class TestDashboardHandler(unittest.TestCase):
 
     def test_refresh_query_forces_refresh(self):
         with patch("atp_dashboard.fetch_rankings", return_value=self.sample) as mocked:
-            status, _ = self._get("/?refresh=1")
+            status, _, _ = self._get("/?refresh=1")
         self.assertEqual(status, 200)
         mocked.assert_called_once_with(limit=20, force_refresh=True)
+
+    def test_reflected_xss_payload_is_escaped_with_security_headers(self):
+        from urllib.parse import quote
+
+        payload = '<script>alert("xss")</script>'
+        with patch("atp_dashboard.fetch_rankings", return_value=self.sample):
+            status, body, headers = self._get(f"/?search={quote(payload)}")
+        self.assertEqual(status, 200)
+        self.assertNotIn("<script>", body)
+        self.assertIn("&lt;script&gt;", body)
+        self.assertIn("content-security-policy", headers)
+        self.assertEqual(headers.get("x-content-type-options"), "nosniff")
 
 
 class TestRunServerShutdown(unittest.TestCase):

@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -5,6 +6,7 @@ from http.client import HTTPConnection
 from http.server import HTTPServer
 from threading import Thread
 from unittest.mock import patch
+from urllib.error import URLError
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
@@ -19,6 +21,7 @@ from atp_dashboard import (
     _parse_rank,
     parse_limit_param,
     parse_rankings,
+    rankings_to_json,
     render_dashboard,
 )
 
@@ -215,6 +218,74 @@ class TestDashboardHandler(unittest.TestCase):
         self.assertIn("&lt;script&gt;", body)
         self.assertIn("content-security-policy", headers)
         self.assertEqual(headers.get("x-content-type-options"), "nosniff")
+
+
+class TestRankingsApi(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        DashboardHandler.limit = 20
+        cls.server = HTTPServer(("127.0.0.1", 0), DashboardHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        self.sample = [
+            RankingEntry(rank=1, player="Jannik Sinner", country="ITA", points="11,830"),
+            RankingEntry(rank=2, player="Carlos Alcaraz", country="ESP", points="8,920"),
+        ]
+
+    def _get(self, path: str):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.request("GET", path)
+            response = conn.getresponse()
+            body = response.read().decode("utf-8")
+            return response.status, response.getheader("Content-Type"), body
+        finally:
+            conn.close()
+
+    def test_rankings_to_json_shape(self):
+        self.assertEqual(
+            rankings_to_json(self.sample),
+            [
+                {"rank": 1, "player": "Jannik Sinner", "country": "ITA", "points": "11,830"},
+                {"rank": 2, "player": "Carlos Alcaraz", "country": "ESP", "points": "8,920"},
+            ],
+        )
+
+    def test_api_returns_json_list(self):
+        with patch("atp_dashboard.fetch_rankings", return_value=self.sample) as mocked:
+            status, content_type, body = self._get("/api/rankings")
+        self.assertEqual(status, 200)
+        self.assertEqual(content_type, "application/json; charset=utf-8")
+        mocked.assert_called_once_with(limit=20, force_refresh=False)
+        self.assertEqual(json.loads(body), rankings_to_json(self.sample))
+
+    def test_api_limit_and_search(self):
+        with patch("atp_dashboard.fetch_rankings", return_value=self.sample) as mocked:
+            status, _, body = self._get("/api/rankings?limit=5&search=alcaraz")
+        self.assertEqual(status, 200)
+        mocked.assert_called_once_with(limit=5, force_refresh=False)
+        self.assertEqual(
+            json.loads(body),
+            [{"rank": 2, "player": "Carlos Alcaraz", "country": "ESP", "points": "8,920"}],
+        )
+
+    def test_api_upstream_failure_returns_503(self):
+        with patch(
+            "atp_dashboard.fetch_rankings",
+            side_effect=URLError("upstream down"),
+        ):
+            status, content_type, body = self._get("/api/rankings")
+        self.assertEqual(status, 503)
+        self.assertEqual(content_type, "application/json; charset=utf-8")
+        self.assertIn("error", json.loads(body))
 
 
 class TestRunServerShutdown(unittest.TestCase):

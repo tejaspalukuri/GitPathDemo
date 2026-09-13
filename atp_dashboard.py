@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import List
@@ -226,34 +227,24 @@ def parse_limit_param(raw_value: str | None, default: int) -> int:
     return max(MIN_LIMIT, min(limit, MAX_LIMIT))
 
 
+def rankings_to_json(rankings: List[RankingEntry]) -> list[dict]:
+    return [asdict(entry) for entry in rankings]
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     limit = 20
 
-    def do_GET(self) -> None:  # noqa: N802
-        parsed_url = urlparse(self.path)
-        query_params = parse_qs(parsed_url.query)
+    def _send_json(self, status: int, payload: object) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-        raw_limit = query_params["limit"][0] if "limit" in query_params else None
-        limit = parse_limit_param(raw_limit, self.limit)
-
-        search_query = query_params.get("search", [None])[0]
-        force_refresh = query_params.get("refresh", [""])[0] == "1"
-
-        rankings: List[RankingEntry] = []
-        error_message = None
-        try:
-            rankings = fetch_rankings(limit=limit, force_refresh=force_refresh)
-            if search_query:
-                rankings = [r for r in rankings if search_query.lower() in r.player.lower()]
-            if not rankings:
-                error_message = "No rankings found matching criteria."
-        except URLError as exc:
-            error_message = f"Could not fetch ATP rankings: {exc.reason}"
-
-        page = render_dashboard(rankings, error_message=error_message, search_query=search_query)
+    def _send_html(self, status: int, page: str) -> None:
         payload = page.encode("utf-8")
-
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header(
@@ -263,6 +254,44 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def _load_rankings(
+        self, limit: int, search_query: str | None, force_refresh: bool
+    ) -> List[RankingEntry]:
+        rankings = fetch_rankings(limit=limit, force_refresh=force_refresh)
+        if search_query:
+            rankings = [r for r in rankings if search_query.lower() in r.player.lower()]
+        return rankings
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed_url = urlparse(self.path)
+        query_params = parse_qs(parsed_url.query)
+
+        raw_limit = query_params["limit"][0] if "limit" in query_params else None
+        limit = parse_limit_param(raw_limit, self.limit)
+        search_query = query_params.get("search", [None])[0]
+        force_refresh = query_params.get("refresh", [""])[0] == "1"
+
+        if parsed_url.path == "/api/rankings":
+            try:
+                rankings = self._load_rankings(limit, search_query, force_refresh)
+            except URLError as exc:
+                self._send_json(503, {"error": f"Could not fetch ATP rankings: {exc.reason}"})
+                return
+            self._send_json(200, rankings_to_json(rankings))
+            return
+
+        rankings: List[RankingEntry] = []
+        error_message = None
+        try:
+            rankings = self._load_rankings(limit, search_query, force_refresh)
+            if not rankings:
+                error_message = "No rankings found matching criteria."
+        except URLError as exc:
+            error_message = f"Could not fetch ATP rankings: {exc.reason}"
+
+        page = render_dashboard(rankings, error_message=error_message, search_query=search_query)
+        self._send_html(200, page)
 
 
 def run_server(host: str, port: int, limit: int) -> None:

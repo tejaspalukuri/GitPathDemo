@@ -4,11 +4,20 @@ Simple Python dashboard that scrapes the latest ATP Tour singles rankings and di
 
 ## Run
 
+From the repository root:
+
 ```bash
 python atp_dashboard.py --port 8000
 ```
 
 Then open `http://127.0.0.1:8000` in your browser.
+
+## JSON API
+
+```bash
+curl "http://127.0.0.1:8000/api/rankings"
+curl "http://127.0.0.1:8000/api/rankings?limit=10&search=Alcaraz"
+```
 
 ## Tests
 

@@ -7,21 +7,24 @@ import argparse
 import html
 import json
 import re
+import threading
 import time
 from dataclasses import asdict, dataclass
 from html.parser import HTMLParser
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import List
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from urllib.parse import parse_qs, urlparse
 
 ATP_RANKINGS_URL = "https://www.atptour.com/en/rankings/singles"
 CACHE_TTL_SECONDS = 300  # 5 minutes
+STALE_CACHE_WARNING = "Upstream ATP site unreachable; showing cached data"
 
 _rankings_html_cache: str | None = None
 _rankings_cache_expires_at: float = 0.0
+_cache_lock = threading.Lock()
 
 
 @dataclass
@@ -30,6 +33,12 @@ class RankingEntry:
     player: str
     country: str
     points: str
+
+
+@dataclass
+class RankingsResult:
+    rankings: List[RankingEntry]
+    warning: str | None = None
 
 
 class ATPRankingsParser(HTMLParser):
@@ -114,8 +123,9 @@ def parse_rankings(page_html: str, limit: int) -> List[RankingEntry]:
 
 def clear_rankings_cache() -> None:
     global _rankings_html_cache, _rankings_cache_expires_at
-    _rankings_html_cache = None
-    _rankings_cache_expires_at = 0.0
+    with _cache_lock:
+        _rankings_html_cache = None
+        _rankings_cache_expires_at = 0.0
 
 
 def _fetch_rankings_html() -> str:
@@ -130,33 +140,44 @@ def _fetch_rankings_html() -> str:
         return response.read().decode("utf-8", errors="ignore")
 
 
-def get_rankings_html(force_refresh: bool = False) -> str:
-    """Return ATP rankings HTML, using an in-memory TTL cache when fresh."""
+def get_rankings_html(force_refresh: bool = False) -> tuple[str, str | None]:
+    """Return ATP rankings HTML and an optional stale-cache warning."""
     global _rankings_html_cache, _rankings_cache_expires_at
 
-    now = time.monotonic()
-    if (
-        not force_refresh
-        and _rankings_html_cache is not None
-        and now < _rankings_cache_expires_at
-    ):
-        return _rankings_html_cache
+    with _cache_lock:
+        now = time.monotonic()
+        if (
+            not force_refresh
+            and _rankings_html_cache is not None
+            and now < _rankings_cache_expires_at
+        ):
+            return _rankings_html_cache, None
 
-    body = _fetch_rankings_html()
-    _rankings_html_cache = body
-    _rankings_cache_expires_at = now + CACHE_TTL_SECONDS
-    return body
+        cached_html = _rankings_html_cache
+
+    try:
+        body = _fetch_rankings_html()
+    except (URLError, HTTPError):
+        if cached_html is not None:
+            return cached_html, STALE_CACHE_WARNING
+        raise
+
+    with _cache_lock:
+        _rankings_html_cache = body
+        _rankings_cache_expires_at = time.monotonic() + CACHE_TTL_SECONDS
+    return body, None
 
 
-def fetch_rankings(limit: int = 20, force_refresh: bool = False) -> List[RankingEntry]:
-    body = get_rankings_html(force_refresh=force_refresh)
-    return parse_rankings(body, limit=limit)
+def fetch_rankings(limit: int = 20, force_refresh: bool = False) -> RankingsResult:
+    body, warning = get_rankings_html(force_refresh=force_refresh)
+    return RankingsResult(rankings=parse_rankings(body, limit=limit), warning=warning)
 
 
 def render_dashboard(
     rankings: List[RankingEntry],
     error_message: str | None = None,
     search_query: str | None = None,
+    warning_message: str | None = None,
 ) -> str:
     rows = "\n".join(
         f"<tr><td>{entry.rank}</td><td>{html.escape(entry.player)}</td>"
@@ -164,6 +185,9 @@ def render_dashboard(
         for entry in rankings
     )
     error_html = f"<p class='error'>{html.escape(error_message)}</p>" if error_message else ""
+    warning_html = (
+        f"<p class='warning'>{html.escape(warning_message)}</p>" if warning_message else ""
+    )
     escaped_query = html.escape(search_query or "", quote=True)
     search_html = (
         f"<p class='search-status'>Results matching: <strong>{escaped_query}</strong></p>"
@@ -185,6 +209,7 @@ def render_dashboard(
     th, td {{ padding: 0.6rem; border-bottom: 1px solid #e5e7eb; text-align: left; }}
     th {{ background: #f9fafb; }}
     .error {{ color: #b91c1c; font-weight: bold; }}
+    .warning {{ color: #92400e; background: #fef3c7; padding: 0.5rem 0.75rem; border-radius: 4px; }}
     .search-status {{ margin-top: 0.5rem; color: #4b5563; }}
     .search-form {{ margin-top: 1rem; display: flex; gap: 0.5rem; }}
     .search-form input {{ padding: 0.4rem 0.6rem; border: 1px solid #d1d5db; border-radius: 4px; flex-grow: 1; }}
@@ -201,6 +226,7 @@ def render_dashboard(
       <button type=\"submit\">Search</button>
     </form>
     {search_html}
+    {warning_html}
     {error_html}
     <table>
       <thead><tr><th>Rank</th><th>Player</th><th>Country</th><th>Points</th></tr></thead>
@@ -234,11 +260,16 @@ def rankings_to_json(rankings: List[RankingEntry]) -> list[dict]:
 class DashboardHandler(BaseHTTPRequestHandler):
     limit = 20
 
-    def _send_json(self, status: int, payload: object) -> None:
+    def _send_json(
+        self, status: int, payload: object, extra_headers: dict[str, str] | None = None
+    ) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("X-Content-Type-Options", "nosniff")
+        if extra_headers:
+            for key, value in extra_headers.items():
+                self.send_header(key, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -258,11 +289,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _load_rankings(
         self, limit: int, search_query: str | None, force_refresh: bool
-    ) -> List[RankingEntry]:
-        rankings = fetch_rankings(limit=limit, force_refresh=force_refresh)
+    ) -> RankingsResult:
+        result = fetch_rankings(limit=limit, force_refresh=force_refresh)
+        rankings = result.rankings
         if search_query:
             rankings = [r for r in rankings if search_query.lower() in r.player.lower()]
-        return rankings
+        return RankingsResult(rankings=rankings, warning=result.warning)
 
     def do_GET(self) -> None:  # noqa: N802
         parsed_url = urlparse(self.path)
@@ -275,29 +307,40 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         if parsed_url.path == "/api/rankings":
             try:
-                rankings = self._load_rankings(limit, search_query, force_refresh)
-            except URLError as exc:
-                self._send_json(503, {"error": f"Could not fetch ATP rankings: {exc.reason}"})
+                result = self._load_rankings(limit, search_query, force_refresh)
+            except (URLError, HTTPError) as exc:
+                reason = getattr(exc, "reason", str(exc))
+                self._send_json(503, {"error": f"Could not fetch ATP rankings: {reason}"})
                 return
-            self._send_json(200, rankings_to_json(rankings))
+            extra = {"X-ATP-Warning": result.warning} if result.warning else None
+            self._send_json(200, rankings_to_json(result.rankings), extra_headers=extra)
             return
 
         rankings: List[RankingEntry] = []
         error_message = None
+        warning_message = None
         try:
-            rankings = self._load_rankings(limit, search_query, force_refresh)
+            result = self._load_rankings(limit, search_query, force_refresh)
+            rankings = result.rankings
+            warning_message = result.warning
             if not rankings:
                 error_message = "No rankings found matching criteria."
-        except URLError as exc:
-            error_message = f"Could not fetch ATP rankings: {exc.reason}"
+        except (URLError, HTTPError) as exc:
+            reason = getattr(exc, "reason", str(exc))
+            error_message = f"Could not fetch ATP rankings: {reason}"
 
-        page = render_dashboard(rankings, error_message=error_message, search_query=search_query)
+        page = render_dashboard(
+            rankings,
+            error_message=error_message,
+            search_query=search_query,
+            warning_message=warning_message,
+        )
         self._send_html(200, page)
 
 
 def run_server(host: str, port: int, limit: int) -> None:
     DashboardHandler.limit = limit
-    server = HTTPServer((host, port), DashboardHandler)
+    server = ThreadingHTTPServer((host, port), DashboardHandler)
     print(f"Serving ATP dashboard on http://{host}:{port}")
     try:
         server.serve_forever()

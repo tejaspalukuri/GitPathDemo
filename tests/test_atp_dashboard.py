@@ -17,9 +17,13 @@ from atp_dashboard import (
     ATPRankingsParser,
     DashboardHandler,
     RankingEntry,
+    RankingsResult,
+    STALE_CACHE_WARNING,
     _parse_country,
     _parse_points,
     _parse_rank,
+    clear_rankings_cache,
+    get_rankings_html,
     parse_limit_param,
     parse_rankings,
     rankings_to_json,
@@ -130,6 +134,11 @@ class TestRenderDashboard(unittest.TestCase):
         self.assertIn("&lt;em&gt;boom&lt;/em&gt;", html_out)
         self.assertNotIn("<em>boom</em>", html_out)
 
+    def test_warning_message_is_rendered(self):
+        html_out = render_dashboard([], warning_message=STALE_CACHE_WARNING)
+        self.assertIn(STALE_CACHE_WARNING, html_out)
+        self.assertIn("class='warning'", html_out)
+
 
 class TestParseLimitParam(unittest.TestCase):
     def test_valid_limit(self):
@@ -163,6 +172,7 @@ class TestDashboardHandler(unittest.TestCase):
             RankingEntry(rank=1, player="Jannik Sinner", country="ITA", points="11,830"),
             RankingEntry(rank=2, player="Carlos Alcaraz", country="ESP", points="8,920"),
         ]
+        self.sample_result = RankingsResult(rankings=self.sample)
 
     def _get(self, path: str):
         conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
@@ -176,26 +186,26 @@ class TestDashboardHandler(unittest.TestCase):
             conn.close()
 
     def test_default_request_returns_200(self):
-        with patch("atp_dashboard.fetch_rankings", return_value=self.sample) as mocked:
+        with patch("atp_dashboard.fetch_rankings", return_value=self.sample_result) as mocked:
             status, body, _ = self._get("/")
         self.assertEqual(status, 200)
         mocked.assert_called_once_with(limit=20, force_refresh=False)
         self.assertIn("Jannik Sinner", body)
 
     def test_limit_query_param_is_parsed(self):
-        with patch("atp_dashboard.fetch_rankings", return_value=self.sample) as mocked:
+        with patch("atp_dashboard.fetch_rankings", return_value=self.sample_result) as mocked:
             status, _, _ = self._get("/?limit=5")
         self.assertEqual(status, 200)
         mocked.assert_called_once_with(limit=5, force_refresh=False)
 
     def test_invalid_limit_falls_back_to_default(self):
-        with patch("atp_dashboard.fetch_rankings", return_value=self.sample) as mocked:
+        with patch("atp_dashboard.fetch_rankings", return_value=self.sample_result) as mocked:
             status, _, _ = self._get("/?limit=abc")
         self.assertEqual(status, 200)
         mocked.assert_called_once_with(limit=20, force_refresh=False)
 
     def test_search_query_filters_results(self):
-        with patch("atp_dashboard.fetch_rankings", return_value=self.sample):
+        with patch("atp_dashboard.fetch_rankings", return_value=self.sample_result):
             status, body, _ = self._get("/?search=Alcaraz")
         self.assertEqual(status, 200)
         self.assertIn("Carlos Alcaraz", body)
@@ -203,20 +213,28 @@ class TestDashboardHandler(unittest.TestCase):
         self.assertIn("Results matching:", body)
 
     def test_refresh_query_forces_refresh(self):
-        with patch("atp_dashboard.fetch_rankings", return_value=self.sample) as mocked:
+        with patch("atp_dashboard.fetch_rankings", return_value=self.sample_result) as mocked:
             status, _, _ = self._get("/?refresh=1")
         self.assertEqual(status, 200)
         mocked.assert_called_once_with(limit=20, force_refresh=True)
 
     def test_reflected_search_payload_is_escaped_and_csp_set(self):
         payload = '<script>alert("xss")</script>'
-        with patch("atp_dashboard.fetch_rankings", return_value=self.sample):
+        with patch("atp_dashboard.fetch_rankings", return_value=self.sample_result):
             status, body, headers = self._get(f"/?search={quote(payload)}")
         self.assertEqual(status, 200)
         self.assertNotIn("<script>", body)
         self.assertIn("&lt;script&gt;", body)
         self.assertIn("content-security-policy", headers)
         self.assertEqual(headers.get("x-content-type-options"), "nosniff")
+
+    def test_stale_cache_warning_is_shown(self):
+        stale = RankingsResult(rankings=self.sample, warning=STALE_CACHE_WARNING)
+        with patch("atp_dashboard.fetch_rankings", return_value=stale):
+            status, body, _ = self._get("/")
+        self.assertEqual(status, 200)
+        self.assertIn(STALE_CACHE_WARNING, body)
+        self.assertIn("Jannik Sinner", body)
 
 
 class TestRankingsApi(unittest.TestCase):
@@ -238,6 +256,7 @@ class TestRankingsApi(unittest.TestCase):
             RankingEntry(rank=1, player="Jannik Sinner", country="ITA", points="11,830"),
             RankingEntry(rank=2, player="Carlos Alcaraz", country="ESP", points="8,920"),
         ]
+        self.sample_result = RankingsResult(rankings=self.sample)
 
     def _get(self, path: str):
         conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
@@ -260,7 +279,7 @@ class TestRankingsApi(unittest.TestCase):
         )
 
     def test_api_returns_json_list(self):
-        with patch("atp_dashboard.fetch_rankings", return_value=self.sample) as mocked:
+        with patch("atp_dashboard.fetch_rankings", return_value=self.sample_result) as mocked:
             status, content_type, body = self._get("/api/rankings")
         self.assertEqual(status, 200)
         self.assertEqual(content_type, "application/json; charset=utf-8")
@@ -268,7 +287,7 @@ class TestRankingsApi(unittest.TestCase):
         self.assertEqual(json.loads(body), rankings_to_json(self.sample))
 
     def test_api_limit_and_search(self):
-        with patch("atp_dashboard.fetch_rankings", return_value=self.sample) as mocked:
+        with patch("atp_dashboard.fetch_rankings", return_value=self.sample_result) as mocked:
             status, _, body = self._get("/api/rankings?limit=5&search=alcaraz")
         self.assertEqual(status, 200)
         mocked.assert_called_once_with(limit=5, force_refresh=False)
@@ -288,6 +307,32 @@ class TestRankingsApi(unittest.TestCase):
         self.assertIn("error", json.loads(body))
 
 
+class TestStaleCacheFallback(unittest.TestCase):
+    def setUp(self):
+        clear_rankings_cache()
+
+    def tearDown(self):
+        clear_rankings_cache()
+
+    def test_falls_back_to_stale_cache_on_upstream_failure(self):
+        clear_rankings_cache()
+        with patch("atp_dashboard._fetch_rankings_html", return_value="<tr><td>1</td><td>A</td><td>USA</td><td>10</td></tr>"):
+            html, warning = get_rankings_html(force_refresh=True)
+        self.assertIsNone(warning)
+        self.assertIn("A", html)
+
+        with patch("atp_dashboard._fetch_rankings_html", side_effect=URLError("down")):
+            html, warning = get_rankings_html(force_refresh=True)
+        self.assertEqual(warning, STALE_CACHE_WARNING)
+        self.assertIn("A", html)
+
+    def test_raises_when_no_cache_and_upstream_fails(self):
+        clear_rankings_cache()
+        with patch("atp_dashboard._fetch_rankings_html", side_effect=URLError("down")):
+            with self.assertRaises(URLError):
+                get_rankings_html(force_refresh=True)
+
+
 class TestRunServerShutdown(unittest.TestCase):
     def test_keyboard_interrupt_closes_server_cleanly(self):
         from atp_dashboard import run_server
@@ -297,7 +342,7 @@ class TestRunServerShutdown(unittest.TestCase):
         server = MagicMock()
         server.serve_forever.side_effect = KeyboardInterrupt
 
-        with patch("atp_dashboard.HTTPServer", return_value=server), patch(
+        with patch("atp_dashboard.ThreadingHTTPServer", return_value=server), patch(
             "sys.stdout", new_callable=StringIO
         ) as stdout:
             run_server("127.0.0.1", 8000, 20)

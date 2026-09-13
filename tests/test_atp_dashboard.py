@@ -203,6 +203,49 @@ class TestDashboardHandler(unittest.TestCase):
         self.assertEqual(status, 200)
         mocked.assert_called_once_with(limit=20, force_refresh=True)
 
+    def test_country_filter_returns_matching_players(self):
+        with patch("atp_dashboard.fetch_rankings", return_value=self.sample):
+            status, body = self._get("/?country=ESP")
+        self.assertEqual(status, 200)
+        self.assertIn("Carlos Alcaraz", body)
+        self.assertNotIn("Jannik Sinner", body)
+        self.assertIn('value="ESP" selected', body)
+
+    def test_country_filter_is_case_insensitive(self):
+        with patch("atp_dashboard.fetch_rankings", return_value=self.sample):
+            status, body = self._get("/?country=ita")
+        self.assertEqual(status, 200)
+        self.assertIn("Jannik Sinner", body)
+        self.assertNotIn("Carlos Alcaraz", body)
+
+    def test_country_and_search_filters_combine(self):
+        with patch("atp_dashboard.fetch_rankings", return_value=self.sample):
+            status, body = self._get("/?country=ESP&search=Sinner")
+        self.assertEqual(status, 200)
+        self.assertIn("No rankings found matching criteria.", body)
+
+    def test_unknown_country_returns_empty_state(self):
+        with patch("atp_dashboard.fetch_rankings", return_value=self.sample):
+            status, body = self._get("/?country=ZZZ")
+        self.assertEqual(status, 200)
+        self.assertIn("No rankings found matching criteria.", body)
+
+
+class TestCountryFilterRender(unittest.TestCase):
+    def test_dashboard_includes_country_dropdown(self):
+        rankings = [
+            RankingEntry(rank=1, player="Jannik Sinner", country="ITA", points="11,830"),
+            RankingEntry(rank=2, player="Carlos Alcaraz", country="ESP", points="8,920"),
+        ]
+        html_out = render_dashboard(
+            rankings,
+            country_filter="ESP",
+            available_countries=["ESP", "ITA"],
+        )
+        self.assertIn('<select name="country">', html_out)
+        self.assertIn('value="ESP" selected', html_out)
+        self.assertIn('value="ITA"', html_out)
+
 
 class TestRunServerShutdown(unittest.TestCase):
     def test_keyboard_interrupt_closes_server_cleanly(self):

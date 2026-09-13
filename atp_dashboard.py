@@ -156,6 +156,8 @@ def render_dashboard(
     rankings: List[RankingEntry],
     error_message: str | None = None,
     search_query: str | None = None,
+    country_filter: str | None = None,
+    available_countries: List[str] | None = None,
 ) -> str:
     rows = "\n".join(
         f"<tr><td>{entry.rank}</td><td>{html.escape(entry.player)}</td>"
@@ -164,9 +166,22 @@ def render_dashboard(
     )
     error_html = f"<p class='error'>{html.escape(error_message)}</p>" if error_message else ""
     escaped_query = html.escape(search_query or "", quote=True)
+    selected_country = (country_filter or "").upper()
+    countries = available_countries or sorted({entry.country for entry in rankings if entry.country and entry.country != "N/A"})
+    country_options = ['<option value="">All countries</option>']
+    for code in countries:
+        selected = " selected" if code.upper() == selected_country else ""
+        safe_code = html.escape(code, quote=True)
+        country_options.append(f'<option value="{safe_code}"{selected}>{safe_code}</option>')
+    country_options_html = "\n".join(country_options)
+    status_bits = []
+    if search_query:
+        status_bits.append(f"player <strong>{escaped_query}</strong>")
+    if selected_country:
+        status_bits.append(f"country <strong>{html.escape(selected_country)}</strong>")
     search_html = (
-        f"<p class='search-status'>Results matching: <strong>{escaped_query}</strong></p>"
-        if search_query
+        f"<p class='search-status'>Results matching: {', '.join(status_bits)}</p>"
+        if status_bits
         else ""
     )
 
@@ -186,7 +201,7 @@ def render_dashboard(
     .error {{ color: #b91c1c; font-weight: bold; }}
     .search-status {{ margin-top: 0.5rem; color: #4b5563; }}
     .search-form {{ margin-top: 1rem; display: flex; gap: 0.5rem; }}
-    .search-form input {{ padding: 0.4rem 0.6rem; border: 1px solid #d1d5db; border-radius: 4px; flex-grow: 1; }}
+    .search-form input, .search-form select {{ padding: 0.4rem 0.6rem; border: 1px solid #d1d5db; border-radius: 4px; flex-grow: 1; }}
     .search-form button {{ padding: 0.4rem 0.8rem; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; }}
     a.button {{ display: inline-block; margin-top: 1rem; padding: 0.4rem 0.8rem; text-decoration: none; background: #2563eb; color: #fff; border-radius: 6px; }}
   </style>
@@ -197,6 +212,7 @@ def render_dashboard(
     <p>Source: <a href=\"{ATP_RANKINGS_URL}\">ATP Tour</a></p>
     <form class=\"search-form\" method=\"GET\" action=\"/\">
       <input type=\"text\" name=\"search\" placeholder=\"Search player by name...\" value=\"{escaped_query}\" />
+      <select name=\"country\">{country_options_html}</select>
       <button type=\"submit\">Search</button>
     </form>
     {search_html}
@@ -237,20 +253,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
         limit = parse_limit_param(raw_limit, self.limit)
 
         search_query = query_params.get("search", [None])[0]
+        country_filter = query_params.get("country", [None])[0]
         force_refresh = query_params.get("refresh", [""])[0] == "1"
 
         rankings: List[RankingEntry] = []
+        available_countries: List[str] = []
         error_message = None
         try:
             rankings = fetch_rankings(limit=limit, force_refresh=force_refresh)
+            available_countries = sorted(
+                {entry.country for entry in rankings if entry.country and entry.country != "N/A"}
+            )
             if search_query:
                 rankings = [r for r in rankings if search_query.lower() in r.player.lower()]
+            if country_filter:
+                country_upper = country_filter.upper()
+                rankings = [r for r in rankings if r.country.upper() == country_upper]
             if not rankings:
                 error_message = "No rankings found matching criteria."
         except URLError as exc:
             error_message = f"Could not fetch ATP rankings: {exc.reason}"
 
-        page = render_dashboard(rankings, error_message=error_message, search_query=search_query)
+        page = render_dashboard(
+            rankings,
+            error_message=error_message,
+            search_query=search_query,
+            country_filter=country_filter,
+            available_countries=available_countries,
+        )
         payload = page.encode("utf-8")
 
         self.send_response(200)

@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import argparse
 import html
+import logging
 import re
 import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import List
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from urllib.parse import parse_qs, urlparse
@@ -21,6 +22,10 @@ CACHE_TTL_SECONDS = 300  # 5 minutes
 
 _rankings_html_cache: str | None = None
 _rankings_cache_expires_at: float = 0.0
+
+logger = logging.getLogger(__name__)
+MAX_FETCH_ATTEMPTS = 3
+RETRY_INITIAL_DELAY_SECONDS = 0.5
 
 
 @dataclass
@@ -117,6 +122,10 @@ def clear_rankings_cache() -> None:
     _rankings_cache_expires_at = 0.0
 
 
+def _is_retryable_http_error(exc: HTTPError) -> bool:
+    return exc.code in {408, 425, 429, 500, 502, 503, 504}
+
+
 def _fetch_rankings_html() -> str:
     request = Request(
         ATP_RANKINGS_URL,
@@ -125,8 +134,41 @@ def _fetch_rankings_html() -> str:
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         },
     )
-    with urlopen(request, timeout=20) as response:
-        return response.read().decode("utf-8", errors="ignore")
+    delay = RETRY_INITIAL_DELAY_SECONDS
+    last_error: Exception | None = None
+
+    for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
+        try:
+            with urlopen(request, timeout=20) as response:
+                return response.read().decode("utf-8", errors="ignore")
+        except HTTPError as exc:
+            last_error = exc
+            if not _is_retryable_http_error(exc) or attempt == MAX_FETCH_ATTEMPTS:
+                raise
+            logger.warning(
+                "Transient HTTP %s fetching ATP rankings (attempt %s/%s); retrying in %.1fs",
+                exc.code,
+                attempt,
+                MAX_FETCH_ATTEMPTS,
+                delay,
+            )
+        except URLError as exc:
+            last_error = exc
+            if attempt == MAX_FETCH_ATTEMPTS:
+                raise
+            logger.warning(
+                "Transient network error fetching ATP rankings (attempt %s/%s): %s; retrying in %.1fs",
+                attempt,
+                MAX_FETCH_ATTEMPTS,
+                exc.reason,
+                delay,
+            )
+
+        time.sleep(delay)
+        delay *= 2
+
+    assert last_error is not None
+    raise last_error
 
 
 def get_rankings_html(force_refresh: bool = False) -> str:

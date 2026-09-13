@@ -5,7 +5,15 @@ Simple Python dashboard that scrapes the latest ATP Tour singles rankings and di
 ## Run
 
 ```bash
-python /home/runner/work/GitPathDemo/GitPathDemo/atp_dashboard.py --port 8000
+python atp_dashboard.py --port 8000
 ```
 
 Then open `http://127.0.0.1:8000` in your browser.
+
+## Tests
+
+Run the automated unit test suite with:
+
+```bash
+python -m unittest discover tests
+```

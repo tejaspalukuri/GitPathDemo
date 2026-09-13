@@ -4,6 +4,8 @@ Simple Python dashboard that scrapes the latest ATP Tour singles rankings and di
 
 ## Run
 
+From the repository root:
+
 ```bash
 python atp_dashboard.py --port 8000
 ```

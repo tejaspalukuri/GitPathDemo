@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import html
+import io
 import re
 import time
 from dataclasses import dataclass
@@ -14,7 +16,7 @@ from typing import List
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 ATP_RANKINGS_URL = "https://www.atptour.com/en/rankings/singles"
 CACHE_TTL_SECONDS = 300  # 5 minutes
@@ -152,10 +154,20 @@ def fetch_rankings(limit: int = 20, force_refresh: bool = False) -> List[Ranking
     return parse_rankings(body, limit=limit)
 
 
+def rankings_to_csv(rankings: List[RankingEntry]) -> str:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["Rank", "Player", "Country", "Points"])
+    for entry in rankings:
+        writer.writerow([entry.rank, entry.player, entry.country, entry.points])
+    return buffer.getvalue()
+
+
 def render_dashboard(
     rankings: List[RankingEntry],
     error_message: str | None = None,
     search_query: str | None = None,
+    limit: int | None = None,
 ) -> str:
     rows = "\n".join(
         f"<tr><td>{entry.rank}</td><td>{html.escape(entry.player)}</td>"
@@ -164,6 +176,16 @@ def render_dashboard(
     )
     error_html = f"<p class='error'>{html.escape(error_message)}</p>" if error_message else ""
     escaped_query = html.escape(search_query or "", quote=True)
+    export_params = []
+    if search_query:
+        export_params.append(f"search={quote(search_query)}")
+    if limit is not None:
+        export_params.append(f"limit={limit}")
+    export_query = "&".join(export_params)
+    export_href = html.escape(
+        "/export.csv" + (f"?{export_query}" if export_query else ""),
+        quote=True,
+    )
     search_html = (
         f"<p class='search-status'>Results matching: <strong>{escaped_query}</strong></p>"
         if search_query
@@ -206,6 +228,7 @@ def render_dashboard(
       <tbody>{rows}</tbody>
     </table>
     <a class=\"button\" href=\"/?refresh=1\">Reset / Refresh</a>
+    <a class=\"button\" href=\"{export_href}\">Export CSV</a>
   </div>
 </body>
 </html>"""
@@ -229,6 +252,23 @@ def parse_limit_param(raw_value: str | None, default: int) -> int:
 class DashboardHandler(BaseHTTPRequestHandler):
     limit = 20
 
+    def _load_rankings(
+        self, limit: int, search_query: str | None, force_refresh: bool
+    ) -> List[RankingEntry]:
+        rankings = fetch_rankings(limit=limit, force_refresh=force_refresh)
+        if search_query:
+            rankings = [r for r in rankings if search_query.lower() in r.player.lower()]
+        return rankings
+
+    def _send_csv(self, rankings: List[RankingEntry]) -> None:
+        payload = rankings_to_csv(rankings).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", 'attachment; filename="atp_rankings.csv"')
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_GET(self) -> None:  # noqa: N802
         parsed_url = urlparse(self.path)
         query_params = parse_qs(parsed_url.query)
@@ -239,18 +279,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
         search_query = query_params.get("search", [None])[0]
         force_refresh = query_params.get("refresh", [""])[0] == "1"
 
+        if parsed_url.path == "/export.csv":
+            try:
+                rankings = self._load_rankings(limit, search_query, force_refresh)
+            except URLError:
+                rankings = []
+            self._send_csv(rankings)
+            return
+
         rankings: List[RankingEntry] = []
         error_message = None
         try:
-            rankings = fetch_rankings(limit=limit, force_refresh=force_refresh)
-            if search_query:
-                rankings = [r for r in rankings if search_query.lower() in r.player.lower()]
+            rankings = self._load_rankings(limit, search_query, force_refresh)
             if not rankings:
                 error_message = "No rankings found matching criteria."
         except URLError as exc:
             error_message = f"Could not fetch ATP rankings: {exc.reason}"
 
-        page = render_dashboard(rankings, error_message=error_message, search_query=search_query)
+        page = render_dashboard(
+            rankings,
+            error_message=error_message,
+            search_query=search_query,
+            limit=limit,
+        )
         payload = page.encode("utf-8")
 
         self.send_response(200)

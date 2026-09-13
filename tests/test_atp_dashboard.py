@@ -204,6 +204,73 @@ class TestDashboardHandler(unittest.TestCase):
         mocked.assert_called_once_with(limit=20, force_refresh=True)
 
 
+class TestCsvExport(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        DashboardHandler.limit = 20
+        cls.server = HTTPServer(("127.0.0.1", 0), DashboardHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        self.sample = [
+            RankingEntry(rank=1, player="Jannik Sinner", country="ITA", points="11,830"),
+            RankingEntry(rank=2, player="Carlos Alcaraz", country="ESP", points="8,920"),
+        ]
+
+    def _get(self, path: str):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.request("GET", path)
+            response = conn.getresponse()
+            body = response.read().decode("utf-8")
+            headers = {key.lower(): value for key, value in response.getheaders()}
+            return response.status, body, headers
+        finally:
+            conn.close()
+
+    def test_rankings_to_csv_shape(self):
+        from atp_dashboard import rankings_to_csv
+
+        csv_text = rankings_to_csv(self.sample)
+        self.assertTrue(csv_text.startswith("Rank,Player,Country,Points"))
+        self.assertIn("1,Jannik Sinner,ITA,\"11,830\"", csv_text)
+        self.assertIn("2,Carlos Alcaraz,ESP,\"8,920\"", csv_text)
+
+    def test_export_endpoint_headers_and_body(self):
+        with patch("atp_dashboard.fetch_rankings", return_value=self.sample):
+            status, body, headers = self._get("/export.csv")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("content-type"), "text/csv; charset=utf-8")
+        self.assertEqual(
+            headers.get("content-disposition"),
+            'attachment; filename="atp_rankings.csv"',
+        )
+        self.assertIn("Rank,Player,Country,Points", body)
+        self.assertIn("Jannik Sinner", body)
+
+    def test_export_honors_search_filter(self):
+        with patch("atp_dashboard.fetch_rankings", return_value=self.sample) as mocked:
+            status, body, _ = self._get("/export.csv?limit=5&search=Alcaraz")
+        self.assertEqual(status, 200)
+        mocked.assert_called_once_with(limit=5, force_refresh=False)
+        self.assertIn("Carlos Alcaraz", body)
+        self.assertNotIn("Jannik Sinner", body)
+
+    def test_dashboard_includes_export_button(self):
+        html_out = render_dashboard(self.sample, search_query="Alcaraz", limit=10)
+        self.assertIn("Export CSV", html_out)
+        self.assertIn("/export.csv?", html_out)
+        self.assertIn("search=Alcaraz", html_out)
+        self.assertIn("limit=10", html_out)
+
+
 class TestRunServerShutdown(unittest.TestCase):
     def test_keyboard_interrupt_closes_server_cleanly(self):
         from atp_dashboard import run_server

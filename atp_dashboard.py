@@ -9,7 +9,7 @@ import re
 import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import List
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -262,7 +262,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 def run_server(host: str, port: int, limit: int) -> None:
     DashboardHandler.limit = limit
-    server = HTTPServer((host, port), DashboardHandler)
+    server = ThreadingHTTPServer((host, port), DashboardHandler)
     print(f"Serving ATP dashboard on http://{host}:{port}")
     try:
         server.serve_forever()

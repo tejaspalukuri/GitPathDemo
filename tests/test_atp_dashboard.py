@@ -213,7 +213,7 @@ class TestRunServerShutdown(unittest.TestCase):
         server = MagicMock()
         server.serve_forever.side_effect = KeyboardInterrupt
 
-        with patch("atp_dashboard.HTTPServer", return_value=server), patch(
+        with patch("atp_dashboard.ThreadingHTTPServer", return_value=server), patch(
             "sys.stdout", new_callable=StringIO
         ) as stdout:
             run_server("127.0.0.1", 8000, 20)

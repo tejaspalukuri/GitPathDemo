@@ -264,7 +264,12 @@ def run_server(host: str, port: int, limit: int) -> None:
     DashboardHandler.limit = limit
     server = HTTPServer((host, port), DashboardHandler)
     print(f"Serving ATP dashboard on http://{host}:{port}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
+    finally:
+        server.server_close()
 
 
 def main() -> None:

@@ -204,5 +204,23 @@ class TestDashboardHandler(unittest.TestCase):
         mocked.assert_called_once_with(limit=20, force_refresh=True)
 
 
+class TestRunServerShutdown(unittest.TestCase):
+    def test_keyboard_interrupt_closes_server_cleanly(self):
+        from atp_dashboard import run_server
+        from io import StringIO
+        from unittest.mock import MagicMock
+
+        server = MagicMock()
+        server.serve_forever.side_effect = KeyboardInterrupt
+
+        with patch("atp_dashboard.HTTPServer", return_value=server), patch(
+            "sys.stdout", new_callable=StringIO
+        ) as stdout:
+            run_server("127.0.0.1", 8000, 20)
+
+        server.server_close.assert_called_once()
+        self.assertIn("Server stopped.", stdout.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -222,5 +222,69 @@ class TestRunServerShutdown(unittest.TestCase):
         self.assertIn("Server stopped.", stdout.getvalue())
 
 
+
+class TestUpstreamRetry(unittest.TestCase):
+    def test_retries_transient_failures_then_succeeds(self):
+        from atp_dashboard import _fetch_rankings_html
+        from io import BytesIO
+        from urllib.error import URLError
+
+        responses = [
+            URLError("temporary failure"),
+            URLError("temporary failure"),
+            BytesIO(b"<html>ok</html>"),
+        ]
+
+        def fake_urlopen(request, timeout=20):
+            result = responses.pop(0)
+            if isinstance(result, Exception):
+                raise result
+
+            class FakeResponse:
+                def __enter__(self):
+                    return result
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+                def read(self):
+                    return result.getvalue()
+
+            return FakeResponse()
+
+        with patch("atp_dashboard.urlopen", side_effect=fake_urlopen), patch(
+            "atp_dashboard.time.sleep"
+        ) as sleep_mock:
+            body = _fetch_rankings_html()
+
+        self.assertEqual(body, "<html>ok</html>")
+        self.assertEqual(sleep_mock.call_count, 2)
+        sleep_mock.assert_any_call(0.5)
+        sleep_mock.assert_any_call(1.0)
+
+    def test_does_not_retry_permanent_http_errors(self):
+        from atp_dashboard import _fetch_rankings_html
+        from urllib.error import HTTPError
+
+        error = HTTPError("https://example.com", 404, "Not Found", hdrs=None, fp=None)
+        with patch("atp_dashboard.urlopen", side_effect=error), patch(
+            "atp_dashboard.time.sleep"
+        ) as sleep_mock:
+            with self.assertRaises(HTTPError):
+                _fetch_rankings_html()
+        sleep_mock.assert_not_called()
+
+    def test_raises_after_exhausting_retries(self):
+        from atp_dashboard import _fetch_rankings_html
+        from urllib.error import URLError
+
+        with patch(
+            "atp_dashboard.urlopen", side_effect=URLError("down")
+        ), patch("atp_dashboard.time.sleep") as sleep_mock:
+            with self.assertRaises(URLError):
+                _fetch_rankings_html()
+        self.assertEqual(sleep_mock.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
